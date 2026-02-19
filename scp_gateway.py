@@ -3,6 +3,10 @@ import hashlib, json, time
 
 app = Flask(__name__)
 
+@app.route("/", methods=["GET"])
+def root():
+    return jsonify({"status": "SCP Gateway Running"})
+
 def evaluate_policy(decision_obj: dict) -> dict:
     size = float(decision_obj.get("decision_size_usd", 0))
     authority = decision_obj.get("decision_owner", "UNKNOWN")
