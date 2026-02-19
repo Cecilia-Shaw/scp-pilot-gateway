@@ -1,0 +1,74 @@
+{
+  "boundary_snapshot": {
+    "authority_object": "Risk Committee",
+    "constraints": {
+      "requires_escalation_to": "RISK_COMMITTEE"
+    },
+    "decision_type": "liquidation",
+    "policy_pack": "pilot_pack_v1",
+    "policy_reason": "Size exceeds threshold; escalation required.",
+    "schema_version": "scp.schema.v1",
+    "size_usd": 2500000
+  },
+  "commitment_id": "3895857ff56fc4bfeff05f118e48cfb69f3cf0cc4e9b0700d24df64b3cba69f7",
+  "status": "constrain"
+}
+
+{
+  "boundary_snapshot": {
+    "authority_object": "Risk Committee",
+    "constraints": {
+      "requires_escalation_to": "RISK_COMMITTEE"
+    },
+    "decision_type": "liquidation",
+    "policy_pack": "pilot_pack_v1",
+    "policy_reason": "Size exceeds threshold; escalation required.",
+    "schema_version": "scp.schema.v1",
+    "size_usd": 2500000
+  },
+  "commitment_id": "8e2df6c836b60d587604f81336669ab8a996e778279ec44f51729659530e8f0f",
+  "status": "constrain"
+}
+
+{
+  "boundary_snapshot": {
+    "authority_object": "Risk Committee",
+    "constraints": {},
+    "decision_type": "liquidation",
+    "policy_pack": "pilot_pack_v1",
+    "policy_reason": "Within policy envelope.",
+    "schema_version": "scp.schema.v1",
+    "size_usd": 250000
+  },
+  "commitment_id": "32f3bca0c311e941849f4e3e9478aecc04b602eb7f2d4f9412e6ff86bf68cd0b",
+  "status": "allow"
+}
+
+{
+  "boundary_snapshot": {
+    "authority_object": "Risk Committee",
+    "constraints": {},
+    "decision_type": "liquidation",
+    "policy_pack": "pilot_pack_v1",
+    "policy_reason": "Within policy envelope.",
+    "schema_version": "scp.schema.v1",
+    "size_usd": 250000
+  },
+  "commitment_id": "8f137f139002f5907d18f6c2c6bcec7c6d7481e1652dbaff85262aadf6d388d9",
+  "status": "allow"
+}
+
+{
+  "boundary_snapshot": {
+    "authority_object": "Risk Committee",
+    "constraints": {},
+    "decision_type": "liquidation",
+    "policy_pack": "pilot_pack_v1",
+    "policy_reason": "Within policy envelope.",
+    "schema_version": "scp.schema.v1",
+    "size_usd": 250000
+  },
+  "commitment_id": "7fd06a648b32644e46d5c183fda9b27d0b2df113d51904325f1d9f784905a2ef",
+  "status": "allow"
+}
+
