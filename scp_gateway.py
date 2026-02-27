@@ -3,19 +3,16 @@ from flask import Flask, request, jsonify, g
 
 app = Flask(__name__)
 
-# ---------------- Config ----------------
-def _get_api_keys():
-    """
-    Reads from env: SCP_API_KEYS="key1,key2"
-    Returns a set of keys.
-    """
+# ---------------- Config helpers ----------------
+def _get_api_keys() -> set:
     raw = os.getenv("SCP_API_KEYS", "")  # "key1,key2"
     return set([k.strip() for k in raw.split(",") if k.strip()])
 
-def _get_signing_secret():
+def _get_signing_secret() -> str:
     return os.getenv("SCP_SIGNING_SECRET", "")
 
-ENV = os.getenv("SCP_ENV", "production")
+def _get_env() -> str:
+    return os.getenv("SCP_ENV", "production")
 
 def _now_ts():
     return int(time.time())
@@ -36,24 +33,37 @@ def _before():
     rid = request.headers.get("X-Request-Id") or str(uuid.uuid4())
     g.request_id = rid
 
-    # health endpoint does not require auth
+    # allow health endpoint without auth
     if request.path == "/":
         return None
 
-    # IMPORTANT: load keys dynamically (avoid "stuck" config)
+    # IMPORTANT: read env vars at request time (Railway vars update safety)
     api_keys = _get_api_keys()
     if not api_keys:
-        return jsonify({"error": "SCP_API_KEYS not configured", "request_id": rid}), 500
+        return jsonify({
+            "error": "SCP_API_KEYS not configured",
+            "hint": "Set Railway variable SCP_API_KEYS to something like: pilot_key_123",
+            "request_id": rid
+        }), 500
 
-    # Accept either header name to reduce mistakes
-    key = request.headers.get("X-SCP-API-KEY", "") or request.headers.get("X-API-Key", "")
+    # header alias support
+    key = (
+        request.headers.get("X-SCP-API-KEY", "")
+        or request.headers.get("X-API-Key", "")
+        or request.headers.get("X-Api-Key", "")
+    )
+
     if key not in api_keys:
-        return jsonify({"error": "unauthorized", "request_id": rid}), 401
+        return jsonify({
+            "error": "unauthorized",
+            "hint": "Send header X-SCP-API-KEY (or X-API-Key) with a value included in SCP_API_KEYS",
+            "request_id": rid
+        }), 401
 
 @app.after_request
 def _after(resp):
     resp.headers["X-Request-Id"] = getattr(g, "request_id", "")
-    resp.headers["X-SCP-Env"] = ENV
+    resp.headers["X-SCP-Env"] = _get_env()
     return resp
 
 # ---------------- Core policy evaluation ----------------
@@ -68,8 +78,6 @@ def run_policy(body: dict) -> dict:
       }
     """
     # TODO: paste your existing policy logic here
-    # -------------------------------------------------
-    # 下面只是占位，防止你没贴逻辑时程序报错
     return {
         "verdict": "ALLOW",
         "constraints": "",
@@ -80,7 +88,7 @@ def run_policy(body: dict) -> dict:
 # ---------------- Routes ----------------
 @app.get("/")
 def health():
-    return jsonify({"status": "SCP Gateway Running", "env": ENV})
+    return jsonify({"status": "SCP Gateway Running", "env": _get_env()})
 
 @app.post("/evaluate")
 def evaluate():
