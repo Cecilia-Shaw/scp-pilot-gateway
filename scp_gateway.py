@@ -5,11 +5,16 @@ app = Flask(__name__)
 
 # ---------------- Config ----------------
 def _get_api_keys():
+    """
+    Reads from env: SCP_API_KEYS="key1,key2"
+    Returns a set of keys.
+    """
     raw = os.getenv("SCP_API_KEYS", "")  # "key1,key2"
     return set([k.strip() for k in raw.split(",") if k.strip()])
 
-API_KEYS = _get_api_keys()
-SIGNING_SECRET = os.getenv("SCP_SIGNING_SECRET", "")
+def _get_signing_secret():
+    return os.getenv("SCP_SIGNING_SECRET", "")
+
 ENV = os.getenv("SCP_ENV", "production")
 
 def _now_ts():
@@ -31,14 +36,18 @@ def _before():
     rid = request.headers.get("X-Request-Id") or str(uuid.uuid4())
     g.request_id = rid
 
+    # health endpoint does not require auth
     if request.path == "/":
         return None
 
-    if not API_KEYS:
-        return jsonify({"error": "SCP_API_KEYS not configured"}), 500
+    # IMPORTANT: load keys dynamically (avoid "stuck" config)
+    api_keys = _get_api_keys()
+    if not api_keys:
+        return jsonify({"error": "SCP_API_KEYS not configured", "request_id": rid}), 500
 
-    key = request.headers.get("X-SCP-API-KEY", "")
-    if key not in API_KEYS:
+    # Accept either header name to reduce mistakes
+    key = request.headers.get("X-SCP-API-KEY", "") or request.headers.get("X-API-Key", "")
+    if key not in api_keys:
         return jsonify({"error": "unauthorized", "request_id": rid}), 401
 
 @app.after_request
@@ -97,10 +106,12 @@ def evaluate():
     }
 
     commitment_id = _stable_hash(payload)[:32]
-    if not SIGNING_SECRET:
+
+    signing_secret = _get_signing_secret()
+    if not signing_secret:
         return jsonify({"error": "SCP_SIGNING_SECRET not configured", "request_id": rid}), 500
 
-    signature = _hmac_sha256(SIGNING_SECRET, commitment_id)
+    signature = _hmac_sha256(signing_secret, commitment_id)
 
     resp = {
         "commitment_id": commitment_id,
