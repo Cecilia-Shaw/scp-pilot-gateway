@@ -4,8 +4,8 @@ WORKDIR /app
 
 COPY . .
 
-RUN pip install flask requests
+RUN pip install --no-cache-dir flask requests gunicorn
 
 EXPOSE 5055
 
-CMD ["python", "scp_gateway.py"]
+CMD ["gunicorn", "-w", "2", "-k", "gthread", "--threads", "8", "-b", "0.0.0.0:5055", "scp_gateway:app"]

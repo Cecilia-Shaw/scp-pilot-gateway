@@ -1,74 +1,125 @@
-from flask import Flask, request, jsonify
-import hashlib, json, time
+import os, json, time, hmac, hashlib, uuid
+from flask import Flask, request, jsonify, g
 
 app = Flask(__name__)
 
-@app.route("/", methods=["GET"])
-def root():
-    return jsonify({"status": "SCP Gateway Running"})
+# ---------------- Config ----------------
+def _get_api_keys():
+    raw = os.getenv("SCP_API_KEYS", "")  # "key1,key2"
+    return set([k.strip() for k in raw.split(",") if k.strip()])
 
-def evaluate_policy(decision_obj: dict) -> dict:
-    size = float(decision_obj.get("decision_size_usd", 0))
-    authority = decision_obj.get("decision_owner", "UNKNOWN")
-    decision_type = decision_obj.get("decision_type", "unknown")
+API_KEYS = _get_api_keys()
+SIGNING_SECRET = os.getenv("SCP_SIGNING_SECRET", "")
+ENV = os.getenv("SCP_ENV", "production")
 
-    # Rule 1: size threshold -> constrain
-    if size >= 1_000_000:
-        return {
-            "status": "constrain",
-            "reason": "Size exceeds threshold; escalation required.",
-            "constraints": {"requires_escalation_to": "RISK_COMMITTEE"}
-        }
+def _now_ts():
+    return int(time.time())
 
-    # Rule 2: authority cannot approve liquidation -> reject
-    if decision_type == "liquidation" and authority == "TRADING_TEAM":
-        return {
-            "status": "reject-by-policy",
-            "reason": "Trading team cannot authorize liquidation decisions.",
-            "constraints": {}
-        }
+def _json_log(event: dict):
+    print(json.dumps(event, ensure_ascii=False))
 
-    # Rule 3: default allow
+def _hmac_sha256(secret: str, msg: str) -> str:
+    return hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+def _stable_hash(obj) -> str:
+    s = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+# ---------------- Middleware: request id + auth ----------------
+@app.before_request
+def _before():
+    rid = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    g.request_id = rid
+
+    if request.path == "/":
+        return None
+
+    if not API_KEYS:
+        return jsonify({"error": "SCP_API_KEYS not configured"}), 500
+
+    key = request.headers.get("X-SCP-API-KEY", "")
+    if key not in API_KEYS:
+        return jsonify({"error": "unauthorized", "request_id": rid}), 401
+
+@app.after_request
+def _after(resp):
+    resp.headers["X-Request-Id"] = getattr(g, "request_id", "")
+    resp.headers["X-SCP-Env"] = ENV
+    return resp
+
+# ---------------- Core policy evaluation ----------------
+def run_policy(body: dict) -> dict:
+    """
+    Return:
+      {
+        "verdict": "ALLOW" | "CONSTRAIN" | "REJECT",
+        "constraints": "...",          # "" if none
+        "policy_pack": "pilot_pack_v1",
+        "policy_reason": "..."
+      }
+    """
+    # TODO: paste your existing policy logic here
+    # -------------------------------------------------
+    # 下面只是占位，防止你没贴逻辑时程序报错
     return {
-        "status": "allow",
-        "reason": "Within policy envelope.",
-        "constraints": {}
+        "verdict": "ALLOW",
+        "constraints": "",
+        "policy_pack": "pilot_pack_v1",
+        "policy_reason": "Within policy."
     }
 
-def make_commitment_id(decision_obj: dict) -> str:
-    payload = {
-        "decision_obj": decision_obj,
-        "ts_bucket": int(time.time()) // 10
-    }
-    raw = json.dumps(payload, sort_keys=True).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
+# ---------------- Routes ----------------
+@app.get("/")
+def health():
+    return jsonify({"status": "SCP Gateway Running", "env": ENV})
 
-@app.route("/scp_gateway/evaluate", methods=["POST"])
-@app.route("/evaluate", methods=["POST"])
+@app.post("/evaluate")
 def evaluate():
-    decision_obj = request.get_json(force=True)
+    rid = g.request_id
+    ts = _now_ts()
 
-    verdict = evaluate_policy(decision_obj)
-    commitment_id = make_commitment_id(decision_obj)
+    body = request.get_json(silent=True) or {}
+    decision_type = body.get("decision_type")
+    decision_owner = body.get("decision_owner")
+    decision_size_usd = body.get("decision_size_usd")
 
-    boundary_snapshot = {
-        "decision_type": decision_obj.get("decision_type"),
-        "authority_object": decision_obj.get("decision_owner"),
-        "size_usd": decision_obj.get("decision_size_usd"),
-        "policy_reason": verdict["reason"],
-        "constraints": verdict.get("constraints", {}),
-        "schema_version": "scp.schema.v1",
-        "policy_pack": "pilot_pack_v1"
+    result = run_policy(body)
+
+    payload = {
+        "request_id": rid,
+        "timestamp": ts,
+        "input": {
+            "decision_type": decision_type,
+            "decision_owner": decision_owner,
+            "decision_size_usd": decision_size_usd,
+        },
+        "output": result,
     }
 
-    return jsonify({
-        "status": verdict["status"],
+    commitment_id = _stable_hash(payload)[:32]
+    if not SIGNING_SECRET:
+        return jsonify({"error": "SCP_SIGNING_SECRET not configured", "request_id": rid}), 500
+
+    signature = _hmac_sha256(SIGNING_SECRET, commitment_id)
+
+    resp = {
         "commitment_id": commitment_id,
-        "boundary_snapshot": boundary_snapshot
+        "signature": signature,
+        "timestamp": ts,
+        "request_id": rid,
+        "boundary_snapshot": result,
+    }
+
+    _json_log({
+        "event": "scp.evaluate",
+        "request_id": rid,
+        "timestamp": ts,
+        "commitment_id": commitment_id,
+        "decision_type": decision_type,
+        "decision_owner": decision_owner,
+        "decision_size_usd": decision_size_usd,
+        "verdict": result.get("verdict"),
+        "policy_pack": result.get("policy_pack"),
     })
 
-if __name__ == "__main__":
-    import os
-    port = int(os.environ.get("PORT", 8080))
-    print("Using PORT:", port)
-    app.run(host="0.0.0.0", port=port)
+    return jsonify(resp)
