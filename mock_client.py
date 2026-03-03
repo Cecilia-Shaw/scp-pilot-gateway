@@ -1,27 +1,21 @@
-import requests
+import os
 import json
+import requests
 
-# 模拟 decision object（现实世界客户系统会构造这个）
-decision_object = {
-    "decision_proposal": "Delay liquidation for stressed account",
-    "decision_owner": "Risk Committee",
-    "decision_size_usd": 250000,
-    "decision_type": "liquidation"
+URL = os.getenv("SCP_URL", "https://scp-pilot-gateway-production-42c7.up.railway.app/evaluate")
+API_KEY = os.getenv("SCP_API_KEY", "pilot_key_123")
+
+payload = {
+    "decision_type": "trade",
+    "decision_owner": "risk_team",
+    "decision_size_usd": 100000
 }
 
-try:
-    response = requests.post("http://127.0.0.1:5055/scp_gateway/evaluate", json=decision_object)
+r = requests.post(
+    URL,
+    headers={"X-SCP-API-KEY": API_KEY, "Content-Type": "application/json"},
+    data=json.dumps(payload)
+)
 
-    print("=== SCP Response ===")
-    print("HTTP status:", response.status_code)
-    print("Raw text:", response.text)
-    print(json.dumps(response.json(), indent=2))
-
-    # 模拟客户系统写日志
-    with open("customer_log.txt", "a") as f:
-        f.write(response.text + "\n")
-
-    print("\nCommitment recorded in customer_log.txt")
-
-except Exception as e:
-    print("Error calling SCP:", e)
+print("status:", r.status_code)
+print(r.text)

@@ -1,192 +1,106 @@
- import os, json, time, hmac, hashlib, uuid
-from flask import Flask, request, jsonify, g
+import os
+import time
+import hmac
+import hashlib
+import json
+from typing import Dict, Any, Tuple
+
+from flask import Flask, request, jsonify, make_response
 
 app = Flask(__name__)
 
 # =========================
-# v0.3.1 Config
+# Config (env)
 # =========================
-API_VERSION = "0.3.1"
 ENV = os.getenv("SCP_ENV", "production")
+API_VERSION = os.getenv("SCP_API_VERSION", "0.3.1")
 
-# Security / keys
-def _get_api_keys() -> set:
-    raw = os.getenv("SCP_API_KEYS", "")  # "key1,key2"
-    return set(k.strip() for k in raw.split(",") if k.strip())
+SCP_API_KEYS_RAW = os.getenv("SCP_API_KEYS", "")
+SCP_API_KEYS = {k.strip() for k in SCP_API_KEYS_RAW.split(",") if k.strip()}
 
-def _get_signing_secret() -> str:
-    return os.getenv("SCP_SIGNING_SECRET", "")
-
-def _extract_api_key() -> str:
-    # 推荐：X-SCP-API-KEY
-    # 兼容：X-API-KEY（方便 PowerShell）
-    return (
-        request.headers.get("X-SCP-API-KEY", "")
-        or request.headers.get("X-API-KEY", "")
-        or ""
-    )
-
-# Rate limit (simple in-memory window)
-# 默认：每个 API key 每分钟 60 次（可用 env 改）
-RATE_LIMIT_RPM = int(os.getenv("SCP_RATE_LIMIT_RPM", "60"))
-_rl_state = {}  # key -> (window_start_ts, count)
-
-# Request size guard (optional)
-MAX_BODY_BYTES = int(os.getenv("SCP_MAX_BODY_BYTES", "65536"))  # 64KB default
+SCP_SIGNING_SECRET = os.getenv("SCP_SIGNING_SECRET", "")  # required
+RATE_LIMIT_PER_MIN = int(os.getenv("SCP_RATE_LIMIT_PER_MIN", "60"))  # per api key
 
 # =========================
-# Utils
+# Simple in-memory rate limit
 # =========================
-def _now_ts() -> int:
-    return int(time.time())
+# key -> (window_start_epoch_minute, count)
+_rate_state: Dict[str, Tuple[int, int]] = {}
 
-def _json_log(event: dict):
-    print(json.dumps(event, ensure_ascii=False))
+def _rate_limit_ok(api_key: str) -> bool:
+    now_min = int(time.time() // 60)
+    window, count = _rate_state.get(api_key, (now_min, 0))
+    if window != now_min:
+        window, count = now_min, 0
+    if count >= RATE_LIMIT_PER_MIN:
+        _rate_state[api_key] = (window, count)
+        return False
+    _rate_state[api_key] = (window, count + 1)
+    return True
 
-def _hmac_sha256(secret: str, msg: str) -> str:
-    return hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
-
-def _canonical_json(obj) -> str:
-    # strict deterministic canonical form
+# =========================
+# Deterministic canonicalization
+# =========================
+def _canonical_json(obj: Any) -> str:
+    # Deterministic JSON string
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-def _commitment_id_from_payload(payload: dict) -> str:
-    # deterministic boundary hash (32 hex chars for compact id)
-    return _sha256_hex(_canonical_json(payload))[:32]
+def _hmac_sha256_hex(secret_hex: str, message: str) -> str:
+    # secret expected as hex string (64 hex chars for 32 bytes)
+    secret_bytes = bytes.fromhex(secret_hex)
+    return hmac.new(secret_bytes, message.encode("utf-8"), hashlib.sha256).hexdigest()
 
-def _signature_from_commitment(signing_secret: str, commitment_id: str) -> str:
-    # HMAC over commitment_id only (offline verifiable)
-    return _hmac_sha256(signing_secret, commitment_id)
+# =========================
+# Validation
+# =========================
+REQUIRED_FIELDS = ["decision_type", "decision_owner", "decision_size_usd"]
 
-def _rate_limit_check(api_key: str):
-    if RATE_LIMIT_RPM <= 0:
-        return None  # disabled
+def _error(status: int, msg: str, hint: str = ""):
+    payload = {"error": msg}
+    if hint:
+        payload["hint"] = hint
+    return make_response(jsonify(payload), status)
 
-    now = _now_ts()
-    window = now // 60
-    win_start, cnt = _rl_state.get(api_key, (window, 0))
-    if win_start != window:
-        win_start, cnt = window, 0
+def _auth_ok() -> Tuple[bool, str]:
+    api_key = request.headers.get("X-SCP-API-KEY", "") or request.headers.get("X-API-KEY", "")
+    if not api_key:
+        return False, ""
+    if SCP_API_KEYS and api_key not in SCP_API_KEYS:
+        return False, api_key
+    return True, api_key
 
-    cnt += 1
-    _rl_state[api_key] = (win_start, cnt)
-
-    if cnt > RATE_LIMIT_RPM:
-        return jsonify({
-            "error": "rate_limited",
-            "hint": f"Rate limit exceeded: {RATE_LIMIT_RPM} requests/min per api key",
-        }), 429
-    return None
-
-def _validate_body(body: dict):
-    # strict input validation
-    if not isinstance(body, dict):
-        return "Body must be a JSON object."
-
-    required = ["decision_type", "decision_owner", "decision_size_usd"]
-    for k in required:
-        if k not in body:
-            return f"Missing field: {k}"
-
-    if not isinstance(body.get("decision_type"), str) or not body["decision_type"].strip():
-        return "decision_type must be a non-empty string."
-    if not isinstance(body.get("decision_owner"), str) or not body["decision_owner"].strip():
-        return "decision_owner must be a non-empty string."
-
-    # allow int/float/string-number, but normalize deterministically later
-    v = body.get("decision_size_usd")
+def _normalize_body(body: Dict[str, Any]) -> Dict[str, Any]:
+    # Keep only supported fields for now; anything extra can be added later but must be deterministic
+    dt = str(body.get("decision_type", "")).strip()
+    owner = str(body.get("decision_owner", "")).strip()
+    # size must be int
     try:
-        float(v)
+        size = int(body.get("decision_size_usd", 0))
     except Exception:
-        return "decision_size_usd must be a number (or numeric string)."
-
-    return None
-
-def _normalize_decision_size(v):
-    # deterministic normalization: keep as integer if it is an integer value
-    # otherwise keep as float with minimal representation
-    f = float(v)
-    if f.is_integer():
-        return int(f)
-    return float(f)
+        size = 0
+    return {
+        "decision_type": dt,
+        "decision_owner": owner,
+        "decision_size_usd": size,
+    }
 
 # =========================
-# Middleware: request id + auth + rate limit
+# Policy (pilot_pack_v1)
 # =========================
-@app.before_request
-def _before():
-    # request id
-    rid = request.headers.get("X-Request-Id") or str(uuid.uuid4())
-    g.request_id = rid
-
-    # allow OPTIONS
-    if request.method == "OPTIONS":
-        return None
-
-    # size guard
-    cl = request.content_length
-    if cl is not None and cl > MAX_BODY_BYTES:
-        return jsonify({"error": "payload_too_large", "max_bytes": MAX_BODY_BYTES}), 413
-
-    # allow health endpoints without auth
-    if request.path in ("/", "/healthz"):
-        return None
-
-    api_keys = _get_api_keys()
-    if not api_keys:
-        return jsonify({"error": "SCP_API_KEYS not configured"}), 500
-
-    key = _extract_api_key()
-    if key not in api_keys:
-        return jsonify({
-            "error": "unauthorized",
-            "hint": "Send header X-SCP-API-KEY (or X-API-KEY) with a value included in SCP_API_KEYS",
-            "request_id": rid
-        }), 401
-
-    # rate limit per api key
-    rl = _rate_limit_check(key)
-    if rl is not None:
-        return rl
-
-@app.after_request
-def _after(resp):
-    resp.headers["X-Request-Id"] = getattr(g, "request_id", "")
-    resp.headers["X-SCP-Env"] = ENV
-    resp.headers["X-SCP-Version"] = API_VERSION
-    return resp
-
-# =========================
-# Core policy evaluation (placeholder)
-# =========================
-def run_policy(body: dict) -> dict:
+def run_policy(body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Return:
-      {
-        "verdict": "ALLOW" | "CONSTRAIN" | "REJECT",
-        "constraints": "...",          # "" if none
-        "policy_pack": "pilot_pack_v1",
-        "policy_reason": "..."
-      }
+    Returns:
+      verdict: ALLOW | CONSTRAIN | REJECT
+      constraints: "" or human-readable constraint
+      policy_pack: pilot_pack_v1
+      policy_reason: short reason
     """
-def run_policy(body: dict) -> dict:
-    """
-    Return:
-      {
-        "verdict": "ALLOW" | "CONSTRAIN" | "REJECT",
-        "constraints": str,   # "" if none
-        "policy_pack": str,
-        "policy_reason": str
-      }
-    """
+    size = int(body.get("decision_size_usd", 0))
 
-    # --- deterministic parsing ---
-    size = int(body.get("decision_size_usd", 0) or 0)
-
-    # --- policy thresholds ---
+    # --- thresholds (可按 pilot partner 调整) ---
     if size >= 10_000_000:
         return {
             "verdict": "REJECT",
@@ -209,12 +123,43 @@ def run_policy(body: dict) -> dict:
         "policy_pack": "pilot_pack_v1",
         "policy_reason": "Within policy.",
     }
+
+# =========================
+# Receipt
+# =========================
+def build_receipt(body_norm: Dict[str, Any]) -> Dict[str, Any]:
+    # What we sign must be deterministic and NOT include runtime timestamps
+    policy = run_policy(body_norm)
+
+    boundary_snapshot = {
+        "decision": body_norm,
+        "verdict": policy["verdict"],
+        "policy_pack": policy["policy_pack"],
+        "policy_reason": policy["policy_reason"],
+        "constraints": policy["constraints"],
+        "api_version": API_VERSION,
+        "env": ENV,
+    }
+
+    canonical = _canonical_json(boundary_snapshot)
+    commitment_id = _sha256_hex(canonical)
+
+    # Signature is HMAC(secret, commitment_id)
+    signature = _hmac_sha256_hex(SCP_SIGNING_SECRET, commitment_id)
+
+    receipt = {
+        "commitment_id": commitment_id,
+        "signature": signature,
+        "boundary_snapshot": boundary_snapshot,
+    }
+    return receipt
+
 # =========================
 # Routes
 # =========================
 @app.get("/")
 def root():
-    return jsonify({"env": ENV, "status": "SCP Gateway Running", "version": API_VERSION})
+    return jsonify({"env": ENV, "status": "SCP Pilot Gateway running", "version": API_VERSION})
 
 @app.get("/healthz")
 def healthz():
@@ -222,94 +167,35 @@ def healthz():
 
 @app.post("/evaluate")
 def evaluate():
-    rid = g.request_id
-    ts = _now_ts()
+    if not SCP_SIGNING_SECRET:
+        return _error(500, "server_misconfigured", "Missing SCP_SIGNING_SECRET env var.")
 
-    signing_secret = _get_signing_secret()
-    if not signing_secret:
-        return jsonify({"error": "SCP_SIGNING_SECRET not configured", "request_id": rid}), 500
+    ok, api_key = _auth_ok()
+    if not ok:
+        return _error(401, "unauthorized", "Send header X-SCP-API-KEY (or X-API-KEY) with a valid key in SCP_API_KEYS.")
 
-    body = request.get_json(silent=True) or {}
-    err = _validate_body(body)
-    if err:
-        return jsonify({"error": "invalid_request", "detail": err, "request_id": rid}), 400
+    if not _rate_limit_ok(api_key):
+        return _error(429, "rate_limited", f"Too many requests. Limit={RATE_LIMIT_PER_MIN}/min per key.")
 
-    # normalize input deterministically
-    decision_type = body.get("decision_type").strip()
-    decision_owner = body.get("decision_owner").strip()
-    decision_size_usd = _normalize_decision_size(body.get("decision_size_usd"))
-
-    # evaluate boundary policy
-    result = run_policy({
-        "decision_type": decision_type,
-        "decision_owner": decision_owner,
-        "decision_size_usd": decision_size_usd,
-        # pass through optional context if present
-        "policy_context": body.get("policy_context", None),
-    })
-
-    # ✅ deterministic commitment payload (NO request_id / NO timestamp)
-    commitment_payload = {
-        "decision_type": decision_type,
-        "decision_owner": decision_owner,
-        "decision_size_usd": decision_size_usd,
-        "policy_pack": result.get("policy_pack"),
-        "verdict": result.get("verdict"),
-        "constraints": result.get("constraints", ""),
-        "policy_reason": result.get("policy_reason", ""),
-    }
-
-    commitment_id = _commitment_id_from_payload(commitment_payload)
-    signature = _signature_from_commitment(signing_secret, commitment_id)
-
-    resp = {
-        "commitment_id": commitment_id,
-        "signature": signature,
-        "timestamp": ts,     # allowed, but NOT part of commitment
-        "request_id": rid,   # allowed, but NOT part of commitment
-        "boundary_snapshot": result,
-        "api_version": API_VERSION
-    }
-
-    _json_log({
-        "event": "scp.evaluate",
-        "version": API_VERSION,
-        "request_id": rid,
-        "timestamp": ts,
-        "commitment_id": commitment_id,
-        "decision_type": decision_type,
-        "decision_owner": decision_owner,
-        "decision_size_usd": decision_size_usd,
-        "verdict": result.get("verdict"),
-        "policy_pack": result.get("policy_pack"),
-    })
-
-    return jsonify(resp)
-
-@app.post("/validate")
-def validate():
-    """
-    Optional helper endpoint (server-side verification).
-    Still keep offline verification as the primary story.
-    """
-    rid = g.request_id
-    signing_secret = _get_signing_secret()
-    if not signing_secret:
-        return jsonify({"error": "SCP_SIGNING_SECRET not configured", "request_id": rid}), 500
+    if not request.is_json:
+        return _error(400, "bad_request", "Content-Type must be application/json")
 
     body = request.get_json(silent=True) or {}
-    commitment_id = (body.get("commitment_id") or "").strip()
-    signature = (body.get("signature") or "").strip()
+    for f in REQUIRED_FIELDS:
+        if f not in body:
+            return _error(400, "bad_request", f"Missing field: {f}")
 
-    if not commitment_id or not signature:
-        return jsonify({"error": "invalid_request", "detail": "commitment_id and signature are required", "request_id": rid}), 400
+    body_norm = _normalize_body(body)
+    if not body_norm["decision_type"] or not body_norm["decision_owner"]:
+        return _error(400, "bad_request", "decision_type and decision_owner must be non-empty strings.")
+    if body_norm["decision_size_usd"] <= 0:
+        return _error(400, "bad_request", "decision_size_usd must be a positive integer.")
 
-    expected = _signature_from_commitment(signing_secret, commitment_id)
-    ok = (hmac.compare_digest(expected, signature))
+    receipt = build_receipt(body_norm)
 
-    return jsonify({
-        "ok": ok,
-        "commitment_id": commitment_id,
-        "request_id": rid,
-        "api_version": API_VERSION
-    })
+    resp = jsonify(receipt)
+    resp.headers["X-SCP-Env"] = ENV
+    resp.headers["X-SCP-Version"] = API_VERSION
+    return resp
+ 
+   
