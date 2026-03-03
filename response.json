@@ -1,0 +1,17 @@
+﻿{
+    "boundary_snapshot":  {
+                              "api_version":  "0.3.1",
+                              "constraints":  "Require escalation to risk committee / break-glass approval.",
+                              "decision":  {
+                                               "decision_owner":  "security_oncall",
+                                               "decision_size_usd":  1000000,
+                                               "decision_type":  "break_glass"
+                                           },
+                              "env":  "production",
+                              "policy_pack":  "pilot_pack_v1",
+                              "policy_reason":  "Constrained: size \u003e= 1M threshold.",
+                              "verdict":  "CONSTRAIN"
+                          },
+    "commitment_id":  "d889cd7c4b3773f8004cf1423935552006ec15974dc7cd3cc2cdff19866379b8",
+    "signature":  "89ca636769c8fb4cee34b79191e71d10f08f7fd4730260218e601ab432e1e666"
+}
