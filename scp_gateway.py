@@ -172,31 +172,43 @@ def run_policy(body: dict) -> dict:
         "policy_reason": "..."
       }
     """
-   size = int(body.get("decision_size_usd", 0))
+def run_policy(body: dict) -> dict:
+    """
+    Return:
+      {
+        "verdict": "ALLOW" | "CONSTRAIN" | "REJECT",
+        "constraints": str,   # "" if none
+        "policy_pack": str,
+        "policy_reason": str
+      }
+    """
 
-if size >= 10_000_000:
+    # --- deterministic parsing ---
+    size = int(body.get("decision_size_usd", 0) or 0)
+
+    # --- policy thresholds ---
+    if size >= 10_000_000:
+        return {
+            "verdict": "REJECT",
+            "constraints": "",
+            "policy_pack": "pilot_pack_v1",
+            "policy_reason": "Rejected: size >= 10M threshold.",
+        }
+
+    if size >= 1_000_000:
+        return {
+            "verdict": "CONSTRAIN",
+            "constraints": "Require escalation to risk committee / break-glass approval.",
+            "policy_pack": "pilot_pack_v1",
+            "policy_reason": "Constrained: size >= 1M threshold.",
+        }
+
     return {
-        "verdict": "REJECT",
+        "verdict": "ALLOW",
         "constraints": "",
         "policy_pack": "pilot_pack_v1",
-        "policy_reason": "Rejected: size >= 10M threshold."
+        "policy_reason": "Within policy.",
     }
-
-if size >= 1_000_000:
-    return {
-        "verdict": "CONSTRAIN",
-        "constraints": "Require escalation to risk committee / break-glass approval.",
-        "policy_pack": "pilot_pack_v1",
-        "policy_reason": "Constrained: size >= 1M threshold."
-    }
-
-return {
-    "verdict": "ALLOW",
-    "constraints": "",
-    "policy_pack": "pilot_pack_v1",
-    "policy_reason": "Within policy."
-}
-
 # =========================
 # Routes
 # =========================
