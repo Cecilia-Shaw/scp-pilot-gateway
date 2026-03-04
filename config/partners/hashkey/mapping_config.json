@@ -1,0 +1,19 @@
+﻿{
+  "decision_type_keys": ["decision_type", "type"],
+  "decision_owner_keys": ["decision_owner", "requested_by", "owner"],
+  "decision_size_usd_keys": ["decision_size_usd", "limit_usd", "size_usd"],
+
+  "request_id_keys": ["request_id", "incident_id", "ticket_id"],
+  "idempotency_key_keys": ["idempotency_key", "event_id", "incident_id"],
+  "parent_commitment_id_keys": ["parent_commitment_id", "parent_id"],
+
+  "action_key": "action",
+  "default_decision_type": "break_glass",
+  "default_decision_owner": "security_oncall",
+
+  "action_map": {
+    "freeze_withdrawals": "break_glass",
+    "halt_trading": "break_glass",
+    "override_limits": "break_glass"
+  }
+}

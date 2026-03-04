@@ -1,2 +1,4 @@
 ﻿__pycache__/
+*.pyc
 response.json
+response.*.json

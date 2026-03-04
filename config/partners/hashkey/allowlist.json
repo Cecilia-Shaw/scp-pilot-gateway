@@ -1,0 +1,7 @@
+﻿{
+  "pilot_key_123": {
+    "status": "active",
+    "allowed_owners": ["security_oncall"],
+    "allowed_decision_types": ["break_glass"]
+  }
+}
