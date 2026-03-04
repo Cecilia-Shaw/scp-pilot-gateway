@@ -3,6 +3,13 @@ import time
 import hmac
 import hashlib
 import json
+import os
+import time
+import hmac
+import hashlib
+import json
+import pathlib
+from typing import Dict, Any, Tuple
 from typing import Dict, Any, Tuple
 
 from flask import Flask, request, jsonify, make_response
@@ -49,6 +56,65 @@ def normalize_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(body, dict):
         return {}
+
+# =========================
+# Allowlist config (repo file)
+# =========================
+ALLOWLIST_PATH = os.getenv("SCP_ALLOWLIST_PATH", "allowlist.json")
+_allowlist_cache: Dict[str, Any] = {}
+_allowlist_mtime: float = 0.0
+
+def _load_allowlist() -> Dict[str, Any]:
+    global _allowlist_cache, _allowlist_mtime
+    path = pathlib.Path(ALLOWLIST_PATH)
+
+    if not path.exists():
+        # allowlist missing is a server misconfig in pilot mode
+        return {}
+
+    mtime = path.stat().st_mtime
+    if _allowlist_cache and mtime == _allowlist_mtime:
+        return _allowlist_cache
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    _allowlist_cache = data
+    _allowlist_mtime = mtime
+    return data
+
+def _enforce_key_scope(api_key: str, body_norm: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Enforce:
+      api_key -> allowed_owners
+      api_key -> allowed_decision_types (optional)
+    """
+    allowlist = _load_allowlist()
+    if not allowlist:
+        return False, "allowlist not loaded (missing/invalid allowlist.json)"
+
+    entry = allowlist.get(api_key)
+    if not entry:
+        return False, "api_key not found in allowlist"
+
+    allowed_owners = entry.get("allowed_owners", [])
+    allowed_types = entry.get("allowed_decision_types", [])
+
+    owner = body_norm.get("decision_owner", "")
+    dt = body_norm.get("decision_type", "")
+
+    if allowed_owners and owner not in allowed_owners:
+        return False, f"decision_owner '{owner}' not allowed for this api_key"
+
+    if allowed_types and dt not in allowed_types:
+        return False, f"decision_type '{dt}' not allowed for this api_key"
+
+    return True, ""
 
     # --- decision_type ---
     dt = body.get("decision_type")
@@ -245,6 +311,11 @@ def evaluate():
 
     body_norm = _normalize_body(body)
 
+    # --- enforce key-scoped authority model (role model) ---
+    ok_scope, reason = _enforce_key_scope(api_key, body_norm)
+    if not ok_scope:
+        return _error(403, "forbidden", reason)
+    
     if not body_norm["decision_type"] or not body_norm["decision_owner"]:
         return _error(400, "bad_request", "decision_type and decision_owner must be non-empty strings.")
     if body_norm["decision_size_usd"] <= 0:

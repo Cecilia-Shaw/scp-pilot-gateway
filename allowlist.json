@@ -1,0 +1,6 @@
+{
+  "pilot_key_123": {
+    "allowed_owners": ["security_oncall", "risk_committee", "compliance_duty"],
+    "allowed_decision_types": ["break_glass", "trade", "generic"]
+  }
+}
