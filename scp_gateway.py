@@ -126,7 +126,7 @@ def _load_json_dict_cached(path_str: str) -> Dict[str, Any]:
         return _cache[path_str]
 
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception:
         return {}
 
