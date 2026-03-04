@@ -1,12 +1,13 @@
 import os
 import time
-import hmac
 import hashlib
 import json
 import pathlib
+import base64
 from typing import Dict, Any, Tuple, Optional
 
 from flask import Flask, request, jsonify, make_response
+from cryptography.hazmat.primitives.asymmetric import ed25519
 
 app = Flask(__name__)
 
@@ -14,24 +15,26 @@ app = Flask(__name__)
 # Config (env)
 # ============================================================
 ENV = os.getenv("SCP_ENV", "production")
-API_VERSION = os.getenv("SCP_API_VERSION", "0.3.1")
+API_VERSION = os.getenv("SCP_API_VERSION", "0.4.0")  # NEW: bump for sig algorithm change
 
 SCP_API_KEYS_RAW = os.getenv("SCP_API_KEYS", "")
 SCP_API_KEYS = {k.strip() for k in SCP_API_KEYS_RAW.split(",") if k.strip()}
 
-SCP_SIGNING_SECRET = os.getenv("SCP_SIGNING_SECRET", "").strip()  # required: 64 hex chars
 RATE_LIMIT_PER_MIN = int(os.getenv("SCP_RATE_LIMIT_PER_MIN", "60"))  # per api key
 
-# NEW: policy pack id (human-readable, shows up in receipt)
 POLICY_PACK_ID = os.getenv("SCP_POLICY_PACK_ID", "pilot_pack_v1")
 
-# NEW: repo config files
 ALLOWLIST_PATH = os.getenv("SCP_ALLOWLIST_PATH", "allowlist.json")
 POLICY_CONFIG_PATH = os.getenv("SCP_POLICY_CONFIG_PATH", "policy_config.json")
 
-# NEW: append-only audit log (server-side optional)
 COMMITMENT_LOG_PATH = os.getenv("SCP_COMMITMENT_LOG_PATH", "commitment_log.jsonl")
 ENABLE_COMMITMENT_LOG = os.getenv("SCP_ENABLE_COMMITMENT_LOG", "1").strip() == "1"
+
+# NEW: Ed25519 keys (base64)
+SCP_SIGNING_PRIVATE_KEY_B64 = os.getenv("SCP_SIGNING_PRIVATE_KEY_B64", "").strip()
+SCP_SIGNING_PUBLIC_KEY_B64 = os.getenv("SCP_SIGNING_PUBLIC_KEY_B64", "").strip()
+
+SIG_ALG = "ed25519"  # NEW: explicit signature algorithm label
 
 # ============================================================
 # Simple in-memory rate limit
@@ -52,7 +55,7 @@ def _rate_limit_ok(api_key: str) -> bool:
 
 
 # ============================================================
-# Deterministic canonicalization + signing
+# Deterministic canonicalization
 # ============================================================
 def _canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -62,19 +65,48 @@ def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
-def _is_hex_64(s: str) -> bool:
-    if len(s) != 64:
-        return False
+# ============================================================
+# NEW: Ed25519 signing helpers
+# ============================================================
+_ed_priv: Optional[ed25519.Ed25519PrivateKey] = None
+_ed_pub: Optional[ed25519.Ed25519PublicKey] = None
+
+
+def _b64_to_bytes(s: str) -> bytes:
+    return base64.b64decode(s.encode("utf-8"))
+
+
+def _load_signing_keys() -> Tuple[Optional[ed25519.Ed25519PrivateKey], Optional[ed25519.Ed25519PublicKey]]:
+    """
+    Load Ed25519 private/public keys from env (base64 raw bytes).
+    Cached in memory.
+    """
+    global _ed_priv, _ed_pub
+
+    if _ed_priv and _ed_pub:
+        return _ed_priv, _ed_pub
+
+    if not SCP_SIGNING_PRIVATE_KEY_B64 or not SCP_SIGNING_PUBLIC_KEY_B64:
+        return None, None
+
     try:
-        bytes.fromhex(s)
-        return True
+        priv_bytes = _b64_to_bytes(SCP_SIGNING_PRIVATE_KEY_B64)
+        pub_bytes = _b64_to_bytes(SCP_SIGNING_PUBLIC_KEY_B64)
+        if len(priv_bytes) != 32 or len(pub_bytes) != 32:
+            return None, None
+        _ed_priv = ed25519.Ed25519PrivateKey.from_private_bytes(priv_bytes)
+        _ed_pub = ed25519.Ed25519PublicKey.from_public_bytes(pub_bytes)
+        return _ed_priv, _ed_pub
     except Exception:
-        return False
+        return None, None
 
 
-def _hmac_sha256_hex(secret_hex: str, message: str) -> str:
-    secret_bytes = bytes.fromhex(secret_hex)
-    return hmac.new(secret_bytes, message.encode("utf-8"), hashlib.sha256).hexdigest()
+def _ed25519_sign_hex(message_bytes: bytes) -> str:
+    priv, _ = _load_signing_keys()
+    if not priv:
+        raise RuntimeError("Signing key not configured")
+    sig = priv.sign(message_bytes)  # bytes length 64
+    return sig.hex()
 
 
 # ============================================================
@@ -90,7 +122,7 @@ def _error(status: int, msg: str, hint: str = "", meta: Optional[Dict[str, Any]]
 
 
 # ============================================================
-# Auth + API key extraction
+# Auth
 # ============================================================
 def _auth_ok() -> Tuple[bool, str]:
     api_key = request.headers.get("X-SCP-API-KEY", "") or request.headers.get("X-API-KEY", "")
@@ -103,17 +135,13 @@ def _auth_ok() -> Tuple[bool, str]:
 
 
 # ============================================================
-# NEW: Allowlist role/authority model (key-scoped)
+# Allowlist role/authority model (key-scoped)
 # ============================================================
 _allowlist_cache: Dict[str, Any] = {}
 _allowlist_mtime: float = 0.0
 
 
 def _load_json_file_cached(path_str: str, cache: Dict[str, Any], mtime_holder_name: str) -> Tuple[Dict[str, Any], float]:
-    """
-    Generic loader: reads a JSON dict file with mtime cache.
-    Returns (data_dict, mtime).
-    """
     path = pathlib.Path(path_str)
     if not path.exists():
         return {}, 0.0
@@ -123,7 +151,6 @@ def _load_json_file_cached(path_str: str, cache: Dict[str, Any], mtime_holder_na
     except Exception:
         return {}, 0.0
 
-    # use global mtime variable by name
     current_mtime = globals().get(mtime_holder_name, 0.0)
     if cache and mtime == current_mtime:
         return cache, mtime
@@ -149,11 +176,6 @@ def _load_allowlist() -> Dict[str, Any]:
 
 
 def _enforce_key_scope(api_key: str, body_norm: Dict[str, Any]) -> Tuple[bool, str]:
-    """
-    Enforce:
-      api_key -> allowed_owners
-      api_key -> allowed_decision_types (optional)
-    """
     allowlist = _load_allowlist()
     if not allowlist:
         return False, "allowlist not loaded (missing/invalid allowlist.json)"
@@ -189,7 +211,7 @@ def _file_sha256(path_str: str) -> str:
 
 
 # ============================================================
-# NEW: Policy config (thresholds not in code)
+# Policy config
 # ============================================================
 _policy_cache: Dict[str, Any] = {}
 _policy_mtime: float = 0.0
@@ -220,19 +242,15 @@ def normalize_payload(body: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(body, dict):
         return {}
 
-    # --- decision_type ---
     dt = body.get("decision_type")
     if not dt:
         action = str(body.get("action", "")).strip()
-        # default mapping: any partner action => break_glass
         dt = "break_glass" if action else ""
 
-    # --- decision_owner ---
     owner = body.get("decision_owner")
     if not owner:
         owner = str(body.get("requested_by", "")).strip() or str(body.get("owner", "")).strip()
 
-    # --- decision_size_usd ---
     size_raw = body.get("decision_size_usd")
     if size_raw is None:
         size_raw = body.get("limit_usd", 0)
@@ -308,7 +326,7 @@ def run_policy(body_norm: Dict[str, Any]) -> Dict[str, Any]:
 def build_receipt(body_norm: Dict[str, Any]) -> Dict[str, Any]:
     policy = run_policy(body_norm)
 
-    # IMPORTANT: what is signed must be deterministic (no runtime timestamps)
+    # NEW: include sig_alg + public key (optional) so partner knows how to verify
     boundary_snapshot = {
         "decision": body_norm,
         "verdict": policy["verdict"],
@@ -317,14 +335,17 @@ def build_receipt(body_norm: Dict[str, Any]) -> Dict[str, Any]:
         "constraints": policy["constraints"],
         "api_version": API_VERSION,
         "env": ENV,
-        # NEW: include config hashes (still deterministic, and helps partner see what config was used)
+        "sig_alg": SIG_ALG,  # NEW
+        "pubkey_b64": SCP_SIGNING_PUBLIC_KEY_B64,  # NEW (safe to share)
         "allowlist_sha256": _file_sha256(ALLOWLIST_PATH),
         "policy_config_sha256": _file_sha256(POLICY_CONFIG_PATH),
     }
 
     canonical = _canonical_json(boundary_snapshot)
     commitment_id = _sha256_hex(canonical)
-    signature = _hmac_sha256_hex(SCP_SIGNING_SECRET, commitment_id)
+
+    # NEW: Ed25519 signature over commitment_id (bytes)
+    signature = _ed25519_sign_hex(commitment_id.encode("utf-8"))
 
     return {
         "commitment_id": commitment_id,
@@ -334,7 +355,7 @@ def build_receipt(body_norm: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ============================================================
-# NEW: Append-only audit log (server-side evidence)
+# Append-only audit log (server-side evidence)
 # ============================================================
 def _append_commitment_log(receipt: Dict[str, Any]) -> None:
     if not ENABLE_COMMITMENT_LOG:
@@ -352,7 +373,6 @@ def _append_commitment_log(receipt: Dict[str, Any]) -> None:
         with p.open("a", encoding="utf-8") as f:
             f.write(json.dumps(line, ensure_ascii=False) + "\n")
     except Exception:
-        # logging failure should not break evaluate
         return
 
 
@@ -369,20 +389,22 @@ def healthz():
     return jsonify({"env": ENV, "ok": True, "version": API_VERSION})
 
 
-# NEW: meta endpoint for debugging / partner integration
 @app.get("/meta")
 def meta():
+    priv, pub = _load_signing_keys()
     return jsonify(
         {
             "env": ENV,
             "version": API_VERSION,
             "policy_pack_id": POLICY_PACK_ID,
+            "sig_alg": SIG_ALG,
+            "has_private_key": bool(priv),
+            "has_public_key": bool(pub),
             "allowlist_path": ALLOWLIST_PATH,
             "policy_config_path": POLICY_CONFIG_PATH,
             "allowlist_sha256": _file_sha256(ALLOWLIST_PATH),
             "policy_config_sha256": _file_sha256(POLICY_CONFIG_PATH),
             "rate_limit_per_min": RATE_LIMIT_PER_MIN,
-            "has_signing_secret": bool(SCP_SIGNING_SECRET),
         }
     )
 
@@ -390,10 +412,13 @@ def meta():
 @app.post("/evaluate")
 def evaluate():
     # 0) server config validation
-    if not SCP_SIGNING_SECRET:
-        return _error(500, "server_misconfigured", "Missing SCP_SIGNING_SECRET env var.")
-    if not _is_hex_64(SCP_SIGNING_SECRET):
-        return _error(500, "server_misconfigured", "SCP_SIGNING_SECRET must be 64 hex chars (32 bytes).")
+    priv, pub = _load_signing_keys()
+    if not priv or not pub:
+        return _error(
+            500,
+            "server_misconfigured",
+            "Missing Ed25519 signing keys. Set SCP_SIGNING_PRIVATE_KEY_B64 and SCP_SIGNING_PUBLIC_KEY_B64.",
+        )
 
     # 1) auth
     ok, api_key = _auth_ok()
@@ -415,7 +440,7 @@ def evaluate():
     # 4) parse
     body = request.get_json(silent=True) or {}
 
-    # 5) NEW: normalize partner payload -> canonical fields
+    # 5) normalize partner payload -> canonical fields
     body = normalize_payload(body)
 
     # 6) required fields (after normalize)
@@ -431,7 +456,7 @@ def evaluate():
     if body_norm["decision_size_usd"] <= 0:
         return _error(400, "bad_request", "decision_size_usd must be a positive integer.")
 
-    # 8) NEW: enforce key-scoped authority model (role model)
+    # 8) enforce key-scoped authority model (role model)
     ok_scope, reason = _enforce_key_scope(api_key, body_norm)
     if not ok_scope:
         return _error(403, "forbidden", reason)
@@ -439,11 +464,12 @@ def evaluate():
     # 9) build receipt
     receipt = build_receipt(body_norm)
 
-    # 10) NEW: append-only audit log (server side)
+    # 10) append-only audit log
     _append_commitment_log(receipt)
 
     resp = jsonify(receipt)
     resp.headers["X-SCP-Env"] = ENV
     resp.headers["X-SCP-Version"] = API_VERSION
     resp.headers["X-SCP-Policy-Pack"] = POLICY_PACK_ID
+    resp.headers["X-SCP-Sig-Alg"] = SIG_ALG
     return resp
