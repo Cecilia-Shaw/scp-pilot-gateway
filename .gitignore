@@ -4,4 +4,8 @@ response.json
 commitment_log.jsonl
 .env
 .DS_Store
-dist/
+dist/__pycache__/
+*.pyc
+response.json
+data/
+.env
