@@ -1,7 +1,6 @@
-{
-  "policy_pack_id": "pilot_pack_v1",
-  "constrain_threshold_usd": 1000000,
+﻿{
   "reject_threshold_usd": 10000000,
+  "constrain_threshold_usd": 1000000,
   "constrain_constraints": "Require escalation to risk committee / break-glass approval.",
   "constrain_reason": "Constrained: size >= 1M threshold.",
   "reject_reason": "Rejected: size >= 10M threshold.",
