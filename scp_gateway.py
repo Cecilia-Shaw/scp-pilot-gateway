@@ -17,7 +17,7 @@ app = Flask(__name__)
 # Config (env)
 # ============================================================
 ENV = os.getenv("SCP_ENV", "production").strip()
-API_VERSION = os.getenv("SCP_API_VERSION", "0.6.1").strip()
+API_VERSION = os.getenv("SCP_API_VERSION", "0.6.2").strip()
 
 # Multi-tenant identifiers (partner + gate)
 PARTNER_ID = os.getenv("SCP_PARTNER_ID", "default").strip()
@@ -32,13 +32,13 @@ RATE_LIMIT_PER_MIN = int(os.getenv("SCP_RATE_LIMIT_PER_MIN", "60"))
 # Human readable “policy pack id” (shows up in receipt)
 POLICY_PACK_ID = os.getenv("SCP_POLICY_PACK_ID", "pilot_pack_v1").strip()
 
-# ---- Partner config directory layout (no code change per partner) ----
-# repo layout:
-#   config/partners/<partner_id>/
-#       allowlist.json
-#       mapping_config.json
-#       policy_config.json
-#       partner_meta.json
+# A+ NEW: Partner pack path (single-file config)
+SCP_PARTNER_PACK_PATH = os.getenv("SCP_PARTNER_PACK_PATH", "").strip()
+
+# A+ NEW: Admin key for reload endpoint (server only)
+SCP_ADMIN_API_KEY = os.getenv("SCP_ADMIN_API_KEY", "").strip()
+
+# ---- Partner legacy config directory layout (fallback) ----
 BASE_PARTNERS_DIR = os.getenv("SCP_PARTNERS_DIR", "config/partners").strip()
 PARTNER_DIR = os.getenv("SCP_PARTNER_DIR", "").strip()
 if not PARTNER_DIR:
@@ -49,10 +49,7 @@ MAPPING_CONFIG_PATH = os.getenv("SCP_MAPPING_CONFIG_PATH", str(pathlib.Path(PART
 POLICY_CONFIG_PATH = os.getenv("SCP_POLICY_CONFIG_PATH", str(pathlib.Path(PARTNER_DIR) / "policy_config.json"))
 PARTNER_META_PATH = os.getenv("SCP_PARTNER_META_PATH", str(pathlib.Path(PARTNER_DIR) / "partner_meta.json"))
 
-# ---- Signing (Ed25519) ----
-# Railway env:
-#   SCP_SIGNING_PRIVATE_KEY_B64 = base64(32 bytes seed)  [server only]
-# Optional env (NOT required): SCP_SIGNING_PUBLIC_KEY_B64 (for debugging only)
+# ---- Signing (Ed25519) + key rotation (kid) ----
 KEYS_DIR = os.getenv("SCP_KEYS_DIR", "config/keys").strip()
 PUBLIC_KEYS_JSON_PATH = os.getenv("SCP_PUBLIC_KEYS_JSON_PATH", str(pathlib.Path(KEYS_DIR) / "public_keys.json"))
 ACTIVE_KID_PATH = os.getenv("SCP_ACTIVE_KID_PATH", str(pathlib.Path(KEYS_DIR) / "active_kid.txt"))
@@ -73,6 +70,8 @@ def _sha256_hex(s: str) -> str:
 
 def _file_sha256(path_str: str) -> str:
     p = pathlib.Path(path_str)
+    if not path_str:
+        return ""
     if not p.exists():
         return ""
     try:
@@ -89,12 +88,10 @@ def _error(status: int, msg: str, hint: str = "", meta: Optional[Dict[str, Any]]
     return make_response(jsonify(payload), status)
 
 def _read_text(path: pathlib.Path, encoding: str = "utf-8-sig") -> str:
-    # utf-8-sig handles BOM (Windows Notepad often writes BOM)
     return path.read_text(encoding=encoding)
 
 def _b64_to_bytes(s: str) -> bytes:
     s = (s or "").strip().strip('"').strip("'")
-    # tolerate missing padding
     s += "=" * ((4 - len(s) % 4) % 4)
     return base64.b64decode(s)
 
@@ -127,12 +124,14 @@ def _auth_ok() -> Tuple[bool, str]:
     return True, api_key
 
 # ============================================================
-# Cached JSON loader (partner configs)
+# Cached JSON loader (generic)
 # ============================================================
 _cache: Dict[str, Dict[str, Any]] = {}
 _mtime: Dict[str, float] = {}
 
 def _load_json_dict_cached(path_str: str) -> Dict[str, Any]:
+    if not path_str:
+        return {}
     p = pathlib.Path(path_str)
     if not p.exists():
         return {}
@@ -156,16 +155,55 @@ def _load_json_dict_cached(path_str: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
+def _clear_cache_for_path(path_str: str) -> None:
+    if not path_str:
+        return
+    try:
+        p = pathlib.Path(path_str)
+        key = str(p.resolve())
+        if key in _cache:
+            _cache.pop(key, None)
+        if key in _mtime:
+            _mtime.pop(key, None)
+    except Exception:
+        return
+
+# ============================================================
+# A+ Partner pack loader (single-file)
+# ============================================================
+def _default_pack_path() -> str:
+    # If SCP_PARTNER_PACK_PATH not set, try default location based on PARTNER_ID
+    if SCP_PARTNER_PACK_PATH:
+        return SCP_PARTNER_PACK_PATH
+    return str(pathlib.Path(BASE_PARTNERS_DIR) / PARTNER_ID / "partner_pack.json")
+
+def _load_partner_pack() -> Dict[str, Any]:
+    return _load_json_dict_cached(_default_pack_path())
+
+def _partner_pack_sha256() -> str:
+    return _file_sha256(_default_pack_path())
+
+def _pack_get_section(pack: Dict[str, Any], key: str) -> Dict[str, Any]:
+    v = pack.get(key, {})
+    return v if isinstance(v, dict) else {}
+
 # ============================================================
 # Allowlist (key-scoped role/authority model)
+#   A+ rule: prefer pack.allowlist, else fallback to allowlist.json
 # ============================================================
-def _enforce_key_scope(api_key: str, body_norm: Dict[str, Any]) -> Tuple[bool, str]:
-    allowlist = _load_json_dict_cached(ALLOWLIST_PATH)
+def _get_allowlist(pack: Dict[str, Any]) -> Dict[str, Any]:
+    allowlist = _pack_get_section(pack, "allowlist")
+    if allowlist:
+        return allowlist
+    return _load_json_dict_cached(ALLOWLIST_PATH)
+
+def _enforce_key_scope(api_key: str, body_norm: Dict[str, Any], pack: Dict[str, Any]) -> Tuple[bool, str]:
+    allowlist = _get_allowlist(pack)
     if not allowlist:
-        return False, f"allowlist not loaded (missing/invalid): {ALLOWLIST_PATH}"
+        return False, "allowlist not loaded (missing/invalid allowlist)"
 
     entry = allowlist.get(api_key)
-    if not entry:
+    if not entry or not isinstance(entry, dict):
         return False, "api_key not found in allowlist"
 
     allowed_owners = entry.get("allowed_owners", [])
@@ -183,67 +221,61 @@ def _enforce_key_scope(api_key: str, body_norm: Dict[str, Any]) -> Tuple[bool, s
     return True, ""
 
 # ============================================================
-# Mapping (partner -> canonical) driven by mapping_config.json
+# Mapping (partner -> canonical)
+#   A+ rule: prefer pack.mapping, else fallback to mapping_config.json
 # ============================================================
 REQUIRED_FIELDS = ["decision_type", "decision_owner", "decision_size_usd"]
 
-def normalize_payload(body: Any) -> Dict[str, Any]:
+def _get_mapping_cfg(pack: Dict[str, Any]) -> Dict[str, Any]:
+    m = _pack_get_section(pack, "mapping")
+    if m:
+        return m
+    return _load_json_dict_cached(MAPPING_CONFIG_PATH) or {}
+
+def normalize_payload(body: Any, pack: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(body, dict):
         return {}
 
-    cfg = _load_json_dict_cached(MAPPING_CONFIG_PATH) or {}
+    cfg = _get_mapping_cfg(pack) or {}
 
-    dt_keys = cfg.get("decision_type_keys", ["decision_type", "type"])
-    owner_keys = cfg.get("decision_owner_keys", ["decision_owner", "requested_by", "owner"])
-    size_keys = cfg.get("decision_size_usd_keys", ["decision_size_usd", "limit_usd", "size_usd"])
+    # A+ simple mapping keys:
+    action_key = str(cfg.get("action_key", "action")).strip()
+    owner_key = str(cfg.get("owner_key", cfg.get("decision_owner_key", "requested_by"))).strip()
+    size_key = str(cfg.get("size_key", cfg.get("decision_size_usd_key", "limit_usd"))).strip()
 
-    action_key = cfg.get("action_key", "action")
     action_map = cfg.get("action_map", {}) or {}
-    default_dt = cfg.get("default_decision_type", "break_glass")
-    default_owner = cfg.get("default_decision_owner", "")
+    default_dt = str(cfg.get("default_decision_type", "break_glass")).strip()
+    default_owner = str(cfg.get("default_decision_owner", "")).strip()
 
     # decision_type
-    dt = ""
-    for k in dt_keys:
-        v = body.get(k)
-        if v is not None and str(v).strip():
-            dt = str(v).strip()
-            break
+    dt = str(body.get("decision_type", "")).strip()
     if not dt:
-        action = str(body.get(action_key, "")).strip()
-        if action and action in action_map:
-            dt = str(action_map[action]).strip()
-        elif action:
-            dt = str(default_dt).strip()
+        action_val = str(body.get(action_key, "")).strip()
+        if action_val and action_val in action_map:
+            dt = str(action_map[action_val]).strip()
+        elif action_val:
+            dt = default_dt
         else:
             dt = ""
 
     # decision_owner
-    owner = ""
-    for k in owner_keys:
-        v = body.get(k)
-        if v is not None and str(v).strip():
-            owner = str(v).strip()
-            break
+    owner = str(body.get("decision_owner", "")).strip()
     if not owner:
-        owner = str(default_owner).strip()
+        owner = str(body.get(owner_key, "")).strip()
+    if not owner:
+        owner = default_owner
 
     # decision_size_usd
-    size_raw = None
-    for k in size_keys:
-        if k in body:
-            size_raw = body.get(k)
-            break
+    size_raw = body.get("decision_size_usd", None)
+    if size_raw is None:
+        size_raw = body.get(size_key, None)
+
     try:
         size = int(size_raw) if size_raw is not None else 0
     except Exception:
         size = 0
 
-    return {
-        "decision_type": dt,
-        "decision_owner": owner,
-        "decision_size_usd": size,
-    }
+    return {"decision_type": dt, "decision_owner": owner, "decision_size_usd": size}
 
 def _normalize_body(body: Dict[str, Any]) -> Dict[str, Any]:
     dt = str(body.get("decision_type", "")).strip()
@@ -255,17 +287,24 @@ def _normalize_body(body: Dict[str, Any]) -> Dict[str, Any]:
     return {"decision_type": dt, "decision_owner": owner, "decision_size_usd": size}
 
 # ============================================================
-# Policy (thresholds from policy_config.json)
+# Policy (thresholds)
+#   A+ rule: prefer pack.policy, else fallback to policy_config.json
 # ============================================================
-def run_policy(body_norm: Dict[str, Any]) -> Dict[str, Any]:
-    cfg = _load_json_dict_cached(POLICY_CONFIG_PATH) or {}
+def _get_policy_cfg(pack: Dict[str, Any]) -> Dict[str, Any]:
+    p = _pack_get_section(pack, "policy")
+    if p:
+        return p
+    return _load_json_dict_cached(POLICY_CONFIG_PATH) or {}
+
+def run_policy(body_norm: Dict[str, Any], pack: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = _get_policy_cfg(pack) or {}
 
     reject_threshold = int(cfg.get("reject_threshold_usd", 10_000_000))
     constrain_threshold = int(cfg.get("constrain_threshold_usd", 1_000_000))
 
     constrain_text = str(cfg.get("constrain_constraints", "Require escalation to risk committee / break-glass approval."))
-    constrain_reason = str(cfg.get("constrain_reason", "Constrained: size >= 1M threshold."))
-    reject_reason = str(cfg.get("reject_reason", "Rejected: size >= 10M threshold."))
+    constrain_reason = str(cfg.get("constrain_reason", "Constrained: threshold hit."))
+    reject_reason = str(cfg.get("reject_reason", "Rejected: threshold hit."))
     allow_reason = str(cfg.get("allow_reason", "Within policy."))
 
     size = int(body_norm.get("decision_size_usd", 0))
@@ -319,7 +358,7 @@ def _load_private_key() -> Optional[Ed25519PrivateKey]:
 
 def _sign_commitment_id(commitment_id: str) -> Tuple[str, str, str]:
     """
-    v0.6.1 rule:
+    rule:
       signature = Ed25519.Sign( commitment_id.encode("utf-8") )
       signature returned as hex string (64 bytes -> 128 hex chars)
     returns: (sig_hex, sig_alg, kid)
@@ -336,8 +375,15 @@ def _sign_commitment_id(commitment_id: str) -> Tuple[str, str, str]:
 # ============================================================
 # Receipt (deterministic)
 # ============================================================
-def build_receipt(body_norm: Dict[str, Any]) -> Dict[str, Any]:
-    policy = run_policy(body_norm)
+def build_receipt(body_norm: Dict[str, Any], pack: Dict[str, Any]) -> Dict[str, Any]:
+    policy = run_policy(body_norm, pack)
+
+    pack_sha = _partner_pack_sha256()
+
+    # legacy hashes for fallback/debug only
+    allow_sha = _file_sha256(ALLOWLIST_PATH)
+    map_sha = _file_sha256(MAPPING_CONFIG_PATH)
+    pol_sha = _file_sha256(POLICY_CONFIG_PATH)
 
     boundary_snapshot = {
         "decision": body_norm,
@@ -349,9 +395,14 @@ def build_receipt(body_norm: Dict[str, Any]) -> Dict[str, Any]:
         "env": ENV,
         "partner_id": PARTNER_ID,
         "gate_id": GATE_ID,
-        "allowlist_sha256": _file_sha256(ALLOWLIST_PATH),
-        "mapping_config_sha256": _file_sha256(MAPPING_CONFIG_PATH),
-        "policy_config_sha256": _file_sha256(POLICY_CONFIG_PATH),
+
+        # A+ self-proof
+        "partner_pack_sha256": pack_sha,
+
+        # legacy (kept for debugging; OK if empty)
+        "allowlist_sha256": allow_sha,
+        "mapping_config_sha256": map_sha,
+        "policy_config_sha256": pol_sha,
     }
 
     canonical = _canonical_json(boundary_snapshot)
@@ -386,6 +437,7 @@ def _append_commitment_log(receipt: Dict[str, Any]) -> None:
             "decision": receipt.get("boundary_snapshot", {}).get("decision", {}),
             "kid": receipt.get("kid", ""),
             "sig_alg": receipt.get("sig_alg", ""),
+            "partner_pack_sha256": receipt.get("boundary_snapshot", {}).get("partner_pack_sha256", ""),
         }
         with p.open("a", encoding="utf-8") as f:
             f.write(json.dumps(line, ensure_ascii=False) + "\n")
@@ -393,25 +445,38 @@ def _append_commitment_log(receipt: Dict[str, Any]) -> None:
         return
 
 # ============================================================
+# A+ endpoints
+# ============================================================
+def _require_admin() -> Optional[Any]:
+    # simple admin auth for /reload (server only)
+    if not SCP_ADMIN_API_KEY:
+        return _error(500, "server_misconfigured", "Missing SCP_ADMIN_API_KEY env var.")
+    key = (request.headers.get("X-SCP-ADMIN-KEY", "") or "").strip()
+    if key != SCP_ADMIN_API_KEY:
+        return _error(401, "unauthorized", "Missing/invalid X-SCP-ADMIN-KEY.")
+    return None
+
+def _reload_partner_pack() -> None:
+    # clear cache for partner pack + legacy configs
+    _clear_cache_for_path(_default_pack_path())
+    _clear_cache_for_path(ALLOWLIST_PATH)
+    _clear_cache_for_path(MAPPING_CONFIG_PATH)
+    _clear_cache_for_path(POLICY_CONFIG_PATH)
+    _clear_cache_for_path(PUBLIC_KEYS_JSON_PATH)
+    _clear_cache_for_path(ACTIVE_KID_PATH)
+
+# ============================================================
 # Routes
 # ============================================================
 @app.get("/")
 def root():
     return jsonify(
-        {
-            "env": ENV,
-            "status": "SCP Pilot Gateway running",
-            "version": API_VERSION,
-            "partner_id": PARTNER_ID,
-            "gate_id": GATE_ID,
-        }
+        {"env": ENV, "status": "SCP Pilot Gateway running", "version": API_VERSION, "partner_id": PARTNER_ID, "gate_id": GATE_ID}
     )
 
 @app.get("/healthz")
 def healthz():
-    return jsonify(
-        {"env": ENV, "ok": True, "version": API_VERSION, "partner_id": PARTNER_ID, "gate_id": GATE_ID}
-    )
+    return jsonify({"env": ENV, "ok": True, "version": API_VERSION, "partner_id": PARTNER_ID, "gate_id": GATE_ID})
 
 @app.get("/meta")
 def meta():
@@ -420,6 +485,17 @@ def meta():
 
     public_key_b64_active = (pub_keys.get(kid, "") or "").strip()
     public_key_b64_env = os.getenv("SCP_SIGNING_PUBLIC_KEY_B64", "").strip()
+
+    pack_path = _default_pack_path()
+    pack = _load_partner_pack()
+    pack_sha = _partner_pack_sha256()
+
+    # If pack includes ids, show them for debugging (env still authoritative)
+    pack_partner_id = ""
+    pack_gate_id = ""
+    if pack:
+        pack_partner_id = str(pack.get("partner_id", "")).strip()
+        pack_gate_id = str(pack.get("gate_id", "")).strip()
 
     return jsonify(
         {
@@ -434,15 +510,21 @@ def meta():
             "sig_alg": "ed25519",
             "kid": kid,
 
-            # server key state
             "has_private_key": bool(os.getenv("SCP_SIGNING_PRIVATE_KEY_B64", "").strip()),
             "has_public_keys_file": bool(pub_keys),
 
-            # ⭐⭐⭐ the only strings you should copy for offline verify
+            # verifier convenience
             "public_key_b64_active": public_key_b64_active,
             "public_key_b64_env": public_key_b64_env,
 
-            # paths + hashes for debugging
+            # A+ pack self-proof
+            "partner_pack_path": str(pathlib.Path(pack_path).as_posix()),
+            "partner_pack_loaded": bool(pack),
+            "partner_pack_sha256": pack_sha,
+            "pack_partner_id": pack_partner_id,
+            "pack_gate_id": pack_gate_id,
+
+            # legacy paths + hashes for debugging (ok if empty)
             "partner_dir": str(pathlib.Path(PARTNER_DIR).as_posix()),
             "allowlist_path": str(pathlib.Path(ALLOWLIST_PATH).as_posix()),
             "mapping_config_path": str(pathlib.Path(MAPPING_CONFIG_PATH).as_posix()),
@@ -450,7 +532,44 @@ def meta():
             "allowlist_sha256": _file_sha256(ALLOWLIST_PATH),
             "mapping_config_sha256": _file_sha256(MAPPING_CONFIG_PATH),
             "policy_config_sha256": _file_sha256(POLICY_CONFIG_PATH),
+
             "git_sha": os.getenv("SCP_GIT_SHA", "").strip(),
+        }
+    )
+
+@app.get("/config_digest")
+def config_digest():
+    """
+    Enterprise self-proof: returns only hashes + identifiers (no config plaintext)
+    """
+    kid = _load_active_kid()
+    pack_sha = _partner_pack_sha256()
+    return jsonify(
+        {
+            "env": ENV,
+            "version": API_VERSION,
+            "partner_id": PARTNER_ID,
+            "gate_id": GATE_ID,
+            "policy_pack_id": POLICY_PACK_ID,
+            "kid": kid,
+            "sig_alg": "ed25519",
+            "partner_pack_sha256": pack_sha,
+        }
+    )
+
+@app.post("/reload")
+def reload_config():
+    err = _require_admin()
+    if err is not None:
+        return err
+    _reload_partner_pack()
+    return jsonify(
+        {
+            "ok": True,
+            "reloaded": True,
+            "partner_id": PARTNER_ID,
+            "gate_id": GATE_ID,
+            "partner_pack_sha256": _partner_pack_sha256(),
         }
     )
 
@@ -472,34 +591,37 @@ def evaluate():
     # 4) parse
     body = request.get_json(silent=True) or {}
 
-    # 5) normalize partner payload -> canonical
-    body = normalize_payload(body)
+    # 5) A+ load pack (single-file config)
+    pack = _load_partner_pack()
 
-    # 6) required fields exist
+    # 6) normalize partner payload -> canonical
+    body = normalize_payload(body, pack)
+
+    # 7) required fields exist
     missing = [f for f in REQUIRED_FIELDS if f not in body]
     if missing:
         return _error(400, "bad_request", f"Missing field: {missing[0]}")
 
     body_norm = _normalize_body(body)
 
-    # 7) strict validation
+    # 8) strict validation
     if not body_norm["decision_type"] or not body_norm["decision_owner"]:
         return _error(400, "bad_request", "decision_type and decision_owner must be non-empty strings.")
     if body_norm["decision_size_usd"] <= 0:
         return _error(400, "bad_request", "decision_size_usd must be a positive integer.")
 
-    # 8) enforce key-scoped authority model
-    ok_scope, reason = _enforce_key_scope(api_key, body_norm)
+    # 9) enforce key-scoped authority model
+    ok_scope, reason = _enforce_key_scope(api_key, body_norm, pack)
     if not ok_scope:
         return _error(403, "forbidden", reason)
 
-    # 9) build receipt (must have server private key)
+    # 10) build receipt (must have server private key)
     try:
-        receipt = build_receipt(body_norm)
+        receipt = build_receipt(body_norm, pack)
     except Exception as e:
         return _error(500, "server_misconfigured", str(e))
 
-    # 10) append-only evidence log
+    # 11) append-only evidence log
     _append_commitment_log(receipt)
 
     resp = jsonify(receipt)
