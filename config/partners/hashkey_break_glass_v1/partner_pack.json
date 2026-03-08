@@ -1,0 +1,12 @@
+{
+  "partner_id": "hashkey",
+  "gate_id": "hashkey_break_glass_gate_v1",
+  "policy_pack_id": "pilot_pack_v1",
+
+  "paths": {
+    "allowlist_path": "config/partners/hashkey/allowlist.json",
+    "mapping_config_path": "config/partners/hashkey/mapping_config.json",
+    "policy_config_path": "config/partners/hashkey/policy_config.json",
+    "partner_meta_path": "config/partners/hashkey/partner_meta.json"
+  }
+}
