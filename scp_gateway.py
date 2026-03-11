@@ -17,7 +17,7 @@ app = Flask(__name__)
 # Config (env)
 # ============================================================
 ENV = os.getenv("SCP_ENV", "production").strip()
-API_VERSION = os.getenv("SCP_API_VERSION", "0.6.2").strip()
+API_VERSION = os.getenv("SCP_API_VERSION", "0.6.3").strip()
 
 # Multi-tenant identifiers (partner + gate)
 PARTNER_ID = os.getenv("SCP_PARTNER_ID", "default").strip()
@@ -187,6 +187,57 @@ def _pack_get_section(pack: Dict[str, Any], key: str) -> Dict[str, Any]:
     v = pack.get(key, {})
     return v if isinstance(v, dict) else {}
 
+def _get_pack_schema_version(pack: Dict[str, Any]) -> str:
+    return str(pack.get("schema_version", "")).strip()
+
+def _get_portable_anchor(pack: Dict[str, Any]) -> Dict[str, Any]:
+    v = pack.get("portable_anchor", {})
+    return v if isinstance(v, dict) else {}
+
+def _get_extensible_metadata(pack: Dict[str, Any]) -> Dict[str, Any]:
+    v = pack.get("extensible_metadata", {})
+    return v if isinstance(v, dict) else {}
+
+def _extract_portable_metadata(raw_body: Dict[str, Any], pack: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Optional future-facing metadata for portability / cross-system references.
+    These fields are NOT required for V4 pilot.
+    They are included only if present and non-empty.
+    """
+    if not isinstance(raw_body, dict):
+        return {}
+
+    ext_cfg = _get_extensible_metadata(pack)
+
+    field_map = {
+        "source_system": "supports_source_system",
+        "target_system": "supports_target_system",
+        "case_id": "supports_case_id",
+        "incident_id": "supports_incident_id",
+        "external_reference": "supports_external_reference",
+        "operator_reference": "supports_operator_reference",
+        "shift_reference": "supports_shift_reference",
+    }
+
+    out: Dict[str, Any] = {}
+
+    for field_name, flag_name in field_map.items():
+        if ext_cfg and not ext_cfg.get(flag_name, False):
+            continue
+
+        val = raw_body.get(field_name, None)
+        if val is None:
+            continue
+
+        if isinstance(val, str):
+            val = val.strip()
+            if not val:
+                continue
+
+        out[field_name] = val
+
+    return out
+
 # ============================================================
 # Allowlist (key-scoped role/authority model)
 #   A+ rule: prefer pack.allowlist, else fallback to allowlist.json
@@ -285,7 +336,6 @@ def _normalize_body(body: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         size = 0
     return {"decision_type": dt, "decision_owner": owner, "decision_size_usd": size}
-
 # ============================================================
 # Policy (thresholds)
 #   A+ rule: prefer pack.policy, else fallback to policy_config.json
@@ -375,7 +425,7 @@ def _sign_commitment_id(commitment_id: str) -> Tuple[str, str, str]:
 # ============================================================
 # Receipt (deterministic)
 # ============================================================
-def build_receipt(body_norm: Dict[str, Any], pack: Dict[str, Any]) -> Dict[str, Any]:
+def build_receipt(body_norm: Dict[str, Any], pack: Dict[str, Any], portable_meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     policy = run_policy(body_norm, pack)
 
     pack_sha = _partner_pack_sha256()
@@ -384,6 +434,9 @@ def build_receipt(body_norm: Dict[str, Any], pack: Dict[str, Any]) -> Dict[str, 
     allow_sha = _file_sha256(ALLOWLIST_PATH)
     map_sha = _file_sha256(MAPPING_CONFIG_PATH)
     pol_sha = _file_sha256(POLICY_CONFIG_PATH)
+
+    pack_schema_version = _get_pack_schema_version(pack)
+    portable_anchor = _get_portable_anchor(pack)
 
     boundary_snapshot = {
         "decision": body_norm,
@@ -396,6 +449,13 @@ def build_receipt(body_norm: Dict[str, Any], pack: Dict[str, Any]) -> Dict[str, 
         "partner_id": PARTNER_ID,
         "gate_id": GATE_ID,
 
+        # portability-prep
+        "receipt_schema_version": pack_schema_version or API_VERSION,
+        "portable_anchor": {
+            "primary_id": str(portable_anchor.get("primary_id", "commitment_id")).strip() or "commitment_id",
+            "description": str(portable_anchor.get("description", "portable boundary identity anchor")).strip()
+        },
+
         # A+ self-proof
         "partner_pack_sha256": pack_sha,
 
@@ -404,6 +464,9 @@ def build_receipt(body_norm: Dict[str, Any], pack: Dict[str, Any]) -> Dict[str, 
         "mapping_config_sha256": map_sha,
         "policy_config_sha256": pol_sha,
     }
+
+    if portable_meta:
+        boundary_snapshot["portable_metadata"] = portable_meta
 
     canonical = _canonical_json(boundary_snapshot)
     commitment_id = _sha256_hex(canonical)
@@ -435,6 +498,7 @@ def _append_commitment_log(receipt: Dict[str, Any]) -> None:
             "verdict": receipt.get("boundary_snapshot", {}).get("verdict", ""),
             "policy_pack": receipt.get("boundary_snapshot", {}).get("policy_pack", ""),
             "decision": receipt.get("boundary_snapshot", {}).get("decision", {}),
+            "portable_metadata": receipt.get("boundary_snapshot", {}).get("portable_metadata", {}),
             "kid": receipt.get("kid", ""),
             "sig_alg": receipt.get("sig_alg", ""),
             "partner_pack_sha256": receipt.get("boundary_snapshot", {}).get("partner_pack_sha256", ""),
@@ -490,12 +554,19 @@ def meta():
     pack = _load_partner_pack()
     pack_sha = _partner_pack_sha256()
 
-    # If pack includes ids, show them for debugging (env still authoritative)
+    # If pack includes ids / schema / portability info, show them for debugging
     pack_partner_id = ""
     pack_gate_id = ""
+    pack_schema_version = ""
+    portable_anchor = {}
+    extensible_metadata = {}
+
     if pack:
         pack_partner_id = str(pack.get("partner_id", "")).strip()
         pack_gate_id = str(pack.get("gate_id", "")).strip()
+        pack_schema_version = _get_pack_schema_version(pack)
+        portable_anchor = _get_portable_anchor(pack)
+        extensible_metadata = _get_extensible_metadata(pack)
 
     return jsonify(
         {
@@ -523,6 +594,9 @@ def meta():
             "partner_pack_sha256": pack_sha,
             "pack_partner_id": pack_partner_id,
             "pack_gate_id": pack_gate_id,
+            "pack_schema_version": pack_schema_version,
+            "portable_anchor": portable_anchor,
+            "extensible_metadata": extensible_metadata,
 
             # legacy paths + hashes for debugging (ok if empty)
             "partner_dir": str(pathlib.Path(PARTNER_DIR).as_posix()),
@@ -544,6 +618,10 @@ def config_digest():
     """
     kid = _load_active_kid()
     pack_sha = _partner_pack_sha256()
+    pack = _load_partner_pack()
+    pack_schema_version = _get_pack_schema_version(pack)
+    portable_anchor = _get_portable_anchor(pack)
+
     return jsonify(
         {
             "env": ENV,
@@ -554,6 +632,8 @@ def config_digest():
             "kid": kid,
             "sig_alg": "ed25519",
             "partner_pack_sha256": pack_sha,
+            "pack_schema_version": pack_schema_version,
+            "portable_anchor": portable_anchor,
         }
     )
 
@@ -589,13 +669,14 @@ def evaluate():
         return _error(400, "bad_request", "Content-Type must be application/json")
 
     # 4) parse
-    body = request.get_json(silent=True) or {}
+    raw_body = request.get_json(silent=True) or {}
 
     # 5) A+ load pack (single-file config)
     pack = _load_partner_pack()
 
     # 6) normalize partner payload -> canonical
-    body = normalize_payload(body, pack)
+    body = normalize_payload(raw_body, pack)
+    portable_meta = _extract_portable_metadata(raw_body, pack)
 
     # 7) required fields exist
     missing = [f for f in REQUIRED_FIELDS if f not in body]
@@ -617,7 +698,7 @@ def evaluate():
 
     # 10) build receipt (must have server private key)
     try:
-        receipt = build_receipt(body_norm, pack)
+        receipt = build_receipt(body_norm, pack, portable_meta=portable_meta)
     except Exception as e:
         return _error(500, "server_misconfigured", str(e))
 

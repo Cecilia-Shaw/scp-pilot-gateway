@@ -1,6 +1,7 @@
 ﻿{
     "boundary_snapshot":  {
-                              "api_version":  "0.3.1",
+                              "allowlist_sha256":  "fdee92b07e5481d5b0c0bf702da9895df3cb4df6369826a76cffe0e9f29860c2",
+                              "api_version":  "0.6.2",
                               "constraints":  "Require escalation to risk committee / break-glass approval.",
                               "decision":  {
                                                "decision_owner":  "security_oncall",
@@ -8,10 +9,17 @@
                                                "decision_type":  "break_glass"
                                            },
                               "env":  "production",
+                              "gate_id":  "hashkey_break_glass_gate_v1",
+                              "mapping_config_sha256":  "8bc64a687beadbe7819fe477901bcf68e4902a323b38c3b90a748d4043943aa0",
+                              "partner_id":  "hashkey",
+                              "partner_pack_sha256":  "",
+                              "policy_config_sha256":  "0c55f5adee0f85c634f69e39c51f3a84659f745577002f3180969d3f9bfcf4b6",
                               "policy_pack":  "pilot_pack_v1",
                               "policy_reason":  "Constrained: size \u003e= 1M threshold.",
                               "verdict":  "CONSTRAIN"
                           },
-    "commitment_id":  "d889cd7c4b3773f8004cf1423935552006ec15974dc7cd3cc2cdff19866379b8",
-    "signature":  "89ca636769c8fb4cee34b79191e71d10f08f7fd4730260218e601ab432e1e666"
+    "commitment_id":  "8541803bcd39cc97ef1a10c6d40d7d964234447e52c566896fc1d3c28d36f692",
+    "kid":  "k1",
+    "sig_alg":  "ed25519",
+    "signature":  "14b5747d2bcc3a6f5d307bb99061447b4477d8b5b8ae912a72b9b3b62a3abe7f8a1b14eca73521948e2a50bcde15f5dbd7d79002198ee4a978f4fc82cceebf06"
 }
