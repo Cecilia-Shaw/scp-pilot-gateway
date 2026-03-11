@@ -1,7 +1,23 @@
 {
+  "schema_version": "0.6.3-portability-prep",
   "partner_id": "hashkey",
   "gate_id": "hashkey_break_glass_gate_v1",
   "policy_pack_id": "pilot_pack_v1",
+
+  "portable_anchor": {
+    "primary_id": "commitment_id",
+    "description": "portable boundary identity anchor"
+  },
+
+  "extensible_metadata": {
+    "supports_source_system": true,
+    "supports_target_system": true,
+    "supports_case_id": true,
+    "supports_incident_id": true,
+    "supports_external_reference": true,
+    "supports_operator_reference": true,
+    "supports_shift_reference": true
+  },
 
   "paths": {
     "allowlist_path": "config/partners/hashkey/allowlist.json",
